@@ -27,19 +27,49 @@
 package dppapi
 
 import (
+	"log"
 	"net/http"
 	"strings"
 	"time"
 )
 
 func errorResponse(status int, err error) ImplResponse {
+	code := firstErrorCode(err.Error())
 	return Response(status, Result{Messages: []Message{{
 		MessageType:   "Error",
-		Text:          err.Error(),
-		Code:          firstErrorCode(err.Error()),
+		Text:          clientSafeErrorText(err, status, code),
+		Code:          code,
 		CorrelationId: "",
 		Timestamp:     time.Now().UTC(),
 	}}})
+}
+
+// clientSafeErrorText keeps the wrapped cause out of 5xx response bodies. The
+// DPP-* code is carried by Message.Code, so unlike internal/common/model the
+// text itself can stay generic without losing the classification.
+func clientSafeErrorText(err error, status int, code string) string {
+	if status < http.StatusInternalServerError {
+		return err.Error()
+	}
+
+	// #nosec G706 -- values are escaped by sanitizeLogValue to prevent control-character log injection.
+	log.Printf("❌ %s: %s", sanitizeLogValue(code), sanitizeLogValue(err.Error()))
+
+	if statusText := http.StatusText(status); statusText != "" {
+		return statusText
+	}
+	return http.StatusText(http.StatusInternalServerError)
+}
+
+// sanitizeLogValue escapes the control characters an attacker could use to forge
+// additional log lines.
+func sanitizeLogValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+
+	return strings.NewReplacer("\r", "\\r", "\n", "\\n", "\t", "\\t").Replace(trimmed)
 }
 
 func mapPersistenceError(err error, fallbackStatus int) ImplResponse {

@@ -37,7 +37,9 @@ package model
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -79,6 +81,12 @@ func (e *RequiredError) Error() string {
 type ErrorResponse = Message
 
 // NewErrorResponse creates a standardized error response.
+//
+// Server-side failures (HTTP 5xx) are written to the service log together with
+// their correlation ID, and the caller is given only the leading error code, so
+// the wrapped cause -- database, object-store and other infrastructure detail --
+// stays inside the deployment. Client errors (HTTP 4xx) keep their message
+// because it is actionable for the caller.
 func NewErrorResponse(err error, status int, component, function, info string) ImplResponse {
 	code := strconv.Itoa(status)
 	statusText := strings.ReplaceAll(http.StatusText(status), " ", "")
@@ -86,11 +94,55 @@ func NewErrorResponse(err error, status int, component, function, info string) I
 
 	return Response(status, []Message{{
 		MessageType:   "Error",
-		Text:          err.Error(),
+		Text:          clientSafeErrorText(err, status, correlationID),
 		Code:          code,
 		CorrelationID: correlationID,
 		Timestamp:     time.Now().Format(time.RFC3339),
 	}})
+}
+
+// errorCodePattern matches the leading COMPONENT-THING-STEP token that error
+// strings carry by convention throughout the code base.
+var errorCodePattern = regexp.MustCompile(`^[A-Z0-9]+(?:-[A-Z0-9]+)+$`)
+
+func clientSafeErrorText(err error, status int, correlationID string) string {
+	if status < http.StatusInternalServerError {
+		return err.Error()
+	}
+
+	text := err.Error()
+	log.Printf("❌ %s: %s", correlationID, sanitizeLogValue(text))
+
+	if code, ok := leadingErrorCode(text); ok {
+		return code
+	}
+	if statusText := http.StatusText(status); statusText != "" {
+		return statusText
+	}
+	return http.StatusText(http.StatusInternalServerError)
+}
+
+// leadingErrorCode reports the COMPONENT-THING-STEP code an error string starts
+// with. The code is authored in this repository and carries no request or
+// deployment data, so it stays in the response; everything after it is the
+// wrapped cause and does not.
+func leadingErrorCode(text string) (string, bool) {
+	fields := strings.Fields(text)
+	if len(fields) == 0 || !errorCodePattern.MatchString(fields[0]) {
+		return "", false
+	}
+	return fields[0], true
+}
+
+// sanitizeLogValue escapes the control characters an attacker could use to forge
+// additional log lines.
+func sanitizeLogValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+
+	return strings.NewReplacer("\r", "\\r", "\n", "\\n", "\t", "\\t").Replace(trimmed)
 }
 
 // WriteErrorResponse writes a standardized error response.
